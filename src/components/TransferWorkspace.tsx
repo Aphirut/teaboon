@@ -613,6 +613,17 @@ export default function TransferWorkspace({
   ).results;
   const ruleBlockedResults = calcResults.filter(r => r.ruleNote);
 
+  // รายวิชาเลือก สกร. 2567 ที่ตัวคำนวณจับคู่ให้วิชาเดิมแต่ละวิชา (วิชาที่ถูกแบ่งหน่วยกิตมี id ต่อท้าย _split_)
+  const autoElectiveByOriginId: Record<string, string> = {};
+  calcResults.forEach(r => {
+    if (r.std.type === "บังคับ") return;
+    r.matchingSources.forEach(src => {
+      const code = src.mappedTo2567Code;
+      if (!code || code.startsWith("ELECTIVE_")) return;
+      autoElectiveByOriginId[src.id.split("_split_")[0]] = code;
+    });
+  });
+
   // สรุปกลุ่มวิชาเดิมที่นำมารวมกันเพื่อเทียบเข้าวิชาบังคับ 2567 หนึ่งวิชา
   // (หน่วยกิตรวมต้องไม่น้อยกว่าวิชา 2567 ที่รับเทียบโอน)
   const getCompulsoryGroupInfo = (targetCode: string) => {
@@ -1254,7 +1265,7 @@ export default function TransferWorkspace({
                           </td>
                           <td className="py-3.5 px-4 w-[280px] font-sans">
                             <select
-                              value={subject.mappedTo2567Code?.startsWith("ELECTIVE_") ? activeElectiveCode : subject.mappedTo2567Code}
+                              value={subject.mappedTo2567Code?.startsWith("ELECTIVE_") ? (autoElectiveByOriginId[subject.id] || activeElectiveCode) : subject.mappedTo2567Code}
                               onChange={(e) => handleUpdateOriginSubject(subject.id, "mappedTo2567Code", e.target.value)}
                               className={`w-full px-2 py-1.5 border rounded-lg text-xs outline-none bg-white focus:border-emerald-500 font-sans ${
                                 isCurrentlyForbidden ? "border-rose-400 text-rose-700 bg-rose-50" : "border-gray-200"
@@ -1302,6 +1313,17 @@ export default function TransferWorkspace({
                                 })()
                               )}
                             </select>
+                            {!carry && subject.mappedTo2567Code?.startsWith("ELECTIVE_") && (
+                              autoElectiveByOriginId[subject.id] ? (
+                                <span className="text-3xs text-emerald-700 block mt-1 font-semibold leading-snug">
+                                  ✅ ระบบจับคู่อัตโนมัติจากชื่อวิชาและสาระ → [{autoElectiveByOriginId[subject.id]}] {electiveSubjects2567.find(el => el.code === autoElectiveByOriginId[subject.id])?.name} (เปลี่ยนวิชาได้จากรายการ)
+                                </span>
+                              ) : !isGradeInvalid && (
+                                <span className="text-3xs text-gray-500 block mt-1 leading-snug">
+                                  ℹ️ ยังไม่มีรายวิชาเลือก สกร. 2567 ที่จับคู่ได้ (ต้องรวมหน่วยกิตครบ 3 นก. ในสาระเดียวกัน) หรือเลือกรายวิชาเองจากรายการ
+                                </span>
+                              )
+                            )}
                             {!carry && req.allowedType === "บังคับ" && isCurrentlyCompulsory && subject.mappedTo2567Code !== req.counterpartCode && (
                               <span className="text-3xs text-rose-600 block mt-1 font-semibold">❌ วิชาบังคับเดิมนี้ถ้าเทียบเข้าวิชาบังคับ ต้องเข้า [{req.counterpartCode}] เท่านั้น (หรือเลือกเทียบเป็นวิชาเลือกได้)</span>
                             )}
@@ -1359,7 +1381,7 @@ export default function TransferWorkspace({
                               );
                             })()}
                             {!carry && req.allowedType === "เลือก" && isCurrentlyCompulsory && (
-                              <span className="text-3xs text-rose-600 block mt-1 font-semibold">❌ วิชาเลือกเดิม หรือวิชาที่ไม่มีในคู่บังคับ ห้ามเทียบวิชาบังคับ</span>
+                              <span className="text-3xs text-rose-600 block mt-1 font-semibold">❌ วิชาเลือกเดิม หรือวิชาที่ไม่มีในคู่บังคับ ห้ามเทียบวิชาบังคับ — เลือกรายวิชาเลือก สกร. 2567 แทน หรือเปลี่ยนประเภทวิชาเดิมให้ถูกต้อง</span>
                             )}
                           </td>
                           <td className="py-3.5 px-4 text-center">
