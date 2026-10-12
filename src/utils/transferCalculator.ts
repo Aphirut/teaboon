@@ -10,6 +10,7 @@ import {
 } from "../types";
 import { maxTransferCredits, foreignGradeOptions, vetSemesterCaps, legacyPrathom4Credits } from "../data/curriculumData";
 import { electiveSubjects2567 } from "../data/electiveSubjects";
+import { COURSE_MATCH_THRESHOLD, courseMatchKey } from "../data/courseMatch";
 
 export interface SourceAllocation {
   id: string;
@@ -270,13 +271,38 @@ const bigramSimilarity = (a: string, b: string): number => {
   return (2 * overlap) / ((x.length - 1) + (y.length - 1));
 };
 
+// ผลเปรียบเทียบคำอธิบายรายวิชาด้วย AI (ร้อยละ) คีย์ = courseMatchKey(ชื่อวิชาเดิม, รหัส สกร. 2567)
+// ตั้งค่าจากหน้าจอก่อนคำนวณ ถ้ามีผลของรายวิชาไหน ตัวคำนวณจะใช้ร้อยละนี้ตัดสินแทนความคล้ายของชื่อวิชา
+let aiMatchScores: Record<string, number> = {};
+export function setAiMatchScores(scores: Record<string, number>) {
+  aiMatchScores = scores || {};
+}
+
+// รายวิชาเลือก สกร. 2567 ที่เป็นผู้สมัครในหมวดเดียวกัน เรียงตามความคล้ายของชื่อ (ใช้คัดก่อนส่งให้ AI เปรียบเทียบ)
+export function getElectiveCandidates(category: string, level: EducationLevel, nameHint: string, limit = 3) {
+  const cats = ELECTIVE_CATEGORIES_BY_DETECTED[category];
+  if (!cats) return [];
+  let candidates = electiveSubjects2567.filter(e => e.level === level && cats.includes(e.category));
+  if (category === "ART" || category === "HEALTH") {
+    const words = category === "ART" ? ART_WORDS : HEALTH_WORDS;
+    const narrowed = candidates.filter(e => words.some(w => e.name.includes(w)));
+    if (narrowed.length > 0) candidates = narrowed;
+  }
+  return candidates
+    .map(e => ({ e, score: bigramSimilarity((nameHint || "").toLowerCase(), e.name) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(x => x.e);
+}
+
 // เลือกรายวิชาเลือก สกร. 2567 (จากรายการรายวิชาเลือกจริง) ที่สอดคล้องกับชื่อวิชาต้นทางมากที่สุดในหมวดเดียวกัน
 // excludeCodes: รายวิชาที่ถูกใช้ไปแล้ว (รายวิชา 2567 หนึ่งวิชาเทียบได้ครั้งเดียว)
 export function getSpecificElectiveForCategory(
   category: string,
   level: EducationLevel,
   nameHint: string,
-  excludeCodes?: Set<string>
+  excludeCodes?: Set<string>,
+  originNames?: string[]
 ): { code: string; name: string } {
   const generic =
     level === EducationLevel.PRIMARY
@@ -298,6 +324,27 @@ export function getSpecificElectiveForCategory(
     const words = category === "ART" ? ART_WORDS : HEALTH_WORDS;
     const narrowed = candidates.filter(e => words.some(w => e.name.includes(w)));
     if (narrowed.length > 0) candidates = narrowed;
+  }
+
+  // ถ้ามีผลเปรียบเทียบคำอธิบายด้วย AI ให้ใช้ร้อยละนั้น (เฉลี่ยทุกวิชาเดิมในก้อน) และต้องถึงเกณฑ์ขั้นต่ำ
+  if (originNames && originNames.length > 0) {
+    let aiBest: { code: string; name: string } | null = null;
+    let aiBestPercent = -1;
+    let anyAi = false;
+    for (const e of candidates) {
+      const vals = originNames
+        .map(n => aiMatchScores[courseMatchKey(n, e.code)])
+        .filter((v): v is number => typeof v === "number");
+      if (vals.length === 0) continue;
+      anyAi = true;
+      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      if (avg > aiBestPercent) {
+        aiBestPercent = avg;
+        aiBest = { code: e.code, name: e.name };
+      }
+    }
+    // ต่ำกว่าเกณฑ์ → คืนรหัสว่าง เพื่อให้ตัวคำนวณนับเป็น "เทียบไม่ได้" (failedElectiveGroups)
+    if (anyAi) return aiBestPercent >= COURSE_MATCH_THRESHOLD && aiBest ? aiBest : { code: "", name: "" };
   }
 
   let best = candidates[0];
@@ -772,7 +819,7 @@ export function calculateTransferResults(
                 chunks.forEach(chunk => {
                   const chunkCreditsSum = chunk.reduce((sum, s) => sum + s.credits, 0);
                   const nameSample = chunk.map(s => s.name || "").join(" ");
-                  const electiveMatch = getSpecificElectiveForCategory(cat, studentInfo.level, nameSample, usedElectiveCodes);
+                  const electiveMatch = getSpecificElectiveForCategory(cat, studentInfo.level, nameSample, usedElectiveCodes, chunk.map(s => s.name || ""));
                   if (!electiveMatch.code.startsWith("ELECTIVE_")) usedElectiveCodes.add(electiveMatch.code);
 
                   if (electiveMatch.code) {

@@ -1,9 +1,12 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import { findDecisionQuestionSet } from "./src/data/decisionQuestions";
+import { courseMatchQuestions, COURSE_MATCH_VERSION, scoreToPercent, type CourseMatchRequest } from "./src/data/courseMatch";
 
 // โหลดคีย์จาก .env.local ก่อน (ตามคู่มือติดตั้ง) แล้วค่อยเสริมด้วย .env
 dotenv.config({ path: [".env.local", ".env"] });
@@ -590,6 +593,82 @@ ${context ? `\n[ข้อมูลประกอบจากระบบเท�
     } catch (error: any) {
       console.error("Decisions Endpoint Error:", error);
       return res.status(500).json({ error: error.message || "เกิดข้อผิดพลาดระหว่างเรียกตัวช่วยตัดสินใจ" });
+    }
+  });
+
+  // ---- เปรียบเทียบคำอธิบายรายวิชาเดิมกับรายวิชาเลือก สกร. 2567 พร้อมแคชผล (วิชาที่เคยเทียบแล้วไม่เรียก AI ซ้ำ) ----
+  const matchCachePath = path.join(process.cwd(), "data", "matchCache.json");
+  let matchCache: Record<string, { percent: number; at: string }> = {};
+  try {
+    matchCache = JSON.parse(fs.readFileSync(matchCachePath, "utf-8"));
+  } catch {
+    matchCache = {};
+  }
+  const saveMatchCache = () => {
+    try {
+      fs.mkdirSync(path.dirname(matchCachePath), { recursive: true });
+      fs.writeFileSync(matchCachePath, JSON.stringify(matchCache, null, 2), "utf-8");
+    } catch (e: any) {
+      console.error("Cannot save match cache:", e?.message);
+    }
+  };
+  const skrDescriptions: Array<{ code: string; name: string; credits: number | null; description: string }> = (() => {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(process.cwd(), "src/data/courseDescriptions/skr2567.json"), "utf-8"));
+    } catch {
+      return [];
+    }
+  })();
+
+  app.post("/api/match/course", async (req, res) => {
+    try {
+      const body = (req.body || {}) as CourseMatchRequest;
+      const originName = (body.originName || "").trim();
+      const target = skrDescriptions.find(d => d.code === body.targetCode);
+      if (!originName || !target) {
+        return res.status(400).json({ error: "ต้องระบุชื่อวิชาเดิม (originName) และรหัสรายวิชา สกร. 2567 ที่มีคำอธิบาย (targetCode)" });
+      }
+      const originDescription = (body.originDescription || "").trim();
+      const key = crypto
+        .createHash("sha1")
+        .update([originName, body.originCode || "", originDescription, target.code, target.description, decisionsModel, COURSE_MATCH_VERSION].join("|"))
+        .digest("hex");
+
+      if (!body.force && matchCache[key]) {
+        return res.json({ percent: matchCache[key].percent, cached: true, targetCode: target.code, targetName: target.name });
+      }
+      if (!openRouterApiKey || openRouterApiKey.trim() === "") {
+        return res.status(400).json({
+          error: "ยังไม่ได้ตั้งค่า OPENROUTER_API_KEY ระบบจึงเปรียบเทียบคำอธิบายรายวิชาไม่ได้",
+          hint: "เพิ่มบรรทัด OPENROUTER_API_KEY=คีย์ของท่าน ในไฟล์ .env.local แล้วเริ่มเซิร์ฟเวอร์ใหม่",
+        });
+      }
+
+      const state =
+        `[รายวิชาเดิม]\nรหัส: ${body.originCode || "-"}\nชื่อ: ${originName}\nหน่วยกิต: ${body.originCredits ?? "-"}\n` +
+        `คำอธิบาย: ${originDescription || "(ไม่มีคำอธิบายรายวิชา ให้ประเมินจากชื่อวิชา)"}\n\n` +
+        `[รายวิชาเป้าหมาย สกร. 2567]\nรหัส: ${target.code}\nชื่อ: ${target.name}\nหน่วยกิต: ${target.credits ?? 3}\nคำอธิบาย: ${target.description}`;
+
+      const r = await fetch(decisionsUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${openRouterApiKey}`, "X-Title": "SKR Transfer Credit 2567" },
+        body: JSON.stringify({ model: decisionsModel, state, questions: courseMatchQuestions }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return res.status(502).json({ error: `ตัวช่วยตัดสินใจตอบกลับด้วยรหัส ${r.status}`, detail: text.slice(0, 400) });
+      }
+      const score = JSON.parse(text)?.answers?.similarity?.score;
+      if (typeof score !== "number") {
+        return res.status(502).json({ error: "ผลจากตัวช่วยตัดสินใจไม่มีคะแนนความสอดคล้อง", detail: text.slice(0, 400) });
+      }
+      const percent = scoreToPercent(score);
+      matchCache[key] = { percent, at: new Date().toISOString() };
+      saveMatchCache();
+      return res.json({ percent, cached: false, targetCode: target.code, targetName: target.name });
+    } catch (error: any) {
+      console.error("Course match error:", error);
+      return res.status(500).json({ error: error.message || "เปรียบเทียบคำอธิบายรายวิชาไม่สำเร็จ" });
     }
   });
 

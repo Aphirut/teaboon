@@ -11,6 +11,7 @@ import {
 } from "../types";
 import { standardSubjects2567 } from "../data/curriculumData";
 import { electiveSubjects2567 } from "../data/electiveSubjects";
+import { COURSE_MATCH_THRESHOLD, courseMatchKey } from "../data/courseMatch";
 import {
   calculateTransferResults,
   isCodeMatch,
@@ -20,6 +21,8 @@ import {
   isInvalidGrade,
   isForeignRestrictedTarget,
   detectSubjectCategory,
+  getElectiveCandidates,
+  setAiMatchScores,
   isLearningSkillsSubject,
   isNfeCompulsorySocial,
   isReligionCivicsSubject,
@@ -89,6 +92,65 @@ export default function TransferWorkspace({
   const [parserError, setParserError] = useState<string | null>(null);
   const [parserSuccess, setParserSuccess] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
+
+  // ผลเปรียบเทียบคำอธิบายรายวิชาด้วย AI (ร้อยละ) คีย์ = courseMatchKey(ชื่อวิชาเดิม, รหัส สกร. 2567)
+  const [aiScores, setAiScores] = useState<Record<string, number>>({});
+  const [aiMatching, setAiMatching] = useState(false);
+  const [aiMatchMsg, setAiMatchMsg] = useState<string | null>(null);
+  // ต้องตั้งก่อนคำนวณทุกครั้ง เพื่อให้ตัวคำนวณใช้ร้อยละนี้ตัดสินการเทียบวิชาเลือก
+  setAiMatchScores(aiScores);
+
+  const runAiCourseMatch = async (force = false) => {
+    const targets = originSubjects.filter(
+      s => s.mappedTo2567Code?.startsWith("ELECTIVE_") && !isInvalidGrade(s.grade) && (s.name || "").trim() !== ""
+    );
+    const jobs: Array<{ name: string; code: string; credits: number; target: string }> = [];
+    targets.forEach(s => {
+      const cat = detectSubjectCategory(s.name, s.code);
+      getElectiveCandidates(cat, studentInfo.level, s.name, 3).forEach(c => {
+        if (force || aiScores[courseMatchKey(s.name, c.code)] === undefined) {
+          jobs.push({ name: s.name, code: s.code, credits: s.credits, target: c.code });
+        }
+      });
+    });
+    if (jobs.length === 0) {
+      setAiMatchMsg("ไม่มีคู่รายวิชาที่ต้องเปรียบเทียบเพิ่ม");
+      return;
+    }
+    setAiMatching(true);
+    setAiMatchMsg(null);
+    const next: Record<string, number> = {};
+    let failed = 0;
+    let cachedCount = 0;
+    let lastError = "";
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < jobs.length) {
+        const j = jobs[cursor++];
+        try {
+          const r = await fetch("/api/match/course", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ originName: j.name, originCode: j.code, originCredits: j.credits, targetCode: j.target, force }),
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`);
+          next[courseMatchKey(j.name, j.target)] = data.percent;
+          if (data.cached) cachedCount++;
+        } catch (e: any) {
+          failed++;
+          lastError = e?.message || "ไม่ทราบสาเหตุ";
+        }
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    setAiScores(prev => ({ ...prev, ...next }));
+    const ok = Object.keys(next).length;
+    setAiMatchMsg(
+      `เปรียบเทียบแล้ว ${ok} คู่ (ใช้ผลที่บันทึกไว้ ${cachedCount} คู่)` + (failed ? ` • ไม่สำเร็จ ${failed} คู่: ${lastError}` : "")
+    );
+    setAiMatching(false);
+  };
 
   // Handle uploaded or dropped files
   const handleFileChange = (file: File) => {
@@ -612,6 +674,15 @@ export default function TransferWorkspace({
     experiences
   ).results;
   const ruleBlockedResults = calcResults.filter(r => r.ruleNote);
+
+  // ถ้าวิชาเดิมนี้เคยเปรียบเทียบแล้วแต่ไม่มีรายวิชาไหนถึงเกณฑ์ → คืนข้อความร้อยละสูงสุด
+  const aiBelowThreshold = (name: string): string | null => {
+    const prefix = courseMatchKey(name, "");
+    const vals = Object.entries(aiScores).filter(([k]) => k.startsWith(prefix));
+    if (vals.length === 0) return null;
+    const best = Math.max(...vals.map(([, v]) => Number(v)));
+    return best >= COURSE_MATCH_THRESHOLD ? null : `สูงสุด ${best}%`;
+  };
 
   // รายวิชาเลือก สกร. 2567 ที่ตัวคำนวณจับคู่ให้วิชาเดิมแต่ละวิชา (วิชาที่ถูกแบ่งหน่วยกิตมี id ต่อท้าย _split_)
   const autoElectiveByOriginId: Record<string, string> = {};
@@ -1316,7 +1387,13 @@ export default function TransferWorkspace({
                             {!carry && subject.mappedTo2567Code?.startsWith("ELECTIVE_") && (
                               autoElectiveByOriginId[subject.id] ? (
                                 <span className="text-3xs text-emerald-700 block mt-1 font-semibold leading-snug">
-                                  ✅ ระบบจับคู่อัตโนมัติจากชื่อวิชาและสาระ → [{autoElectiveByOriginId[subject.id]}] {electiveSubjects2567.find(el => el.code === autoElectiveByOriginId[subject.id])?.name} (เปลี่ยนวิชาได้จากรายการ)
+                                  ✅ ระบบจับคู่อัตโนมัติจากชื่อวิชาและสาระ → [{autoElectiveByOriginId[subject.id]}] {electiveSubjects2567.find(el => el.code === autoElectiveByOriginId[subject.id])?.name} {aiScores[courseMatchKey(subject.name, autoElectiveByOriginId[subject.id])] !== undefined
+                                    ? ` — คำอธิบายสอดคล้อง ${aiScores[courseMatchKey(subject.name, autoElectiveByOriginId[subject.id])]}%`
+                                    : ""} (เปลี่ยนวิชาได้จากรายการ)
+                                </span>
+                              ) : !isGradeInvalid && aiBelowThreshold(subject.name) ? (
+                                <span className="text-3xs text-rose-600 block mt-1 font-semibold leading-snug">
+                                  ❌ คำอธิบายรายวิชาสอดคล้องไม่ถึง {COURSE_MATCH_THRESHOLD}% ({aiBelowThreshold(subject.name)}) จึงยังไม่เทียบโอน — เลือกรายวิชาเองจากรายการได้
                                 </span>
                               ) : !isGradeInvalid && (
                                 <span className="text-3xs text-gray-500 block mt-1 leading-snug">
@@ -1412,6 +1489,15 @@ export default function TransferWorkspace({
                           <tr className="bg-amber-50/40 border-y border-amber-100 select-none">
                             <td colSpan={6} className="py-2.5 px-4 font-bold text-xs text-amber-800 text-left">
                               📙 หมวดวิชาเลือกเดิม / วิชาที่เพิ่มเติมเข้ามา (เทียบเข้าวิชาเลือก สกร. 2567 เท่านั้น)
+                              <button
+                                type="button"
+                                disabled={aiMatching}
+                                onClick={() => runAiCourseMatch(false)}
+                                className="ml-3 px-2.5 py-1 rounded-lg bg-amber-600 text-white text-3xs font-bold hover:bg-amber-700 disabled:opacity-50 cursor-pointer"
+                              >
+                                {aiMatching ? "กำลังเปรียบเทียบ..." : `🤖 เปรียบเทียบคำอธิบายรายวิชาด้วย AI (เกณฑ์ ≥ ${COURSE_MATCH_THRESHOLD}%)`}
+                              </button>
+                              {aiMatchMsg && <span className="ml-2 font-normal text-3xs text-amber-900">{aiMatchMsg}</span>}
                             </td>
                           </tr>
                         )}
