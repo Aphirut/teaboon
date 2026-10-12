@@ -1517,6 +1517,18 @@ export default function TransferWorkspace({
                               >
                                 {aiMatching ? "กำลังเปรียบเทียบ..." : `🤖 เปรียบเทียบคำอธิบายรายวิชาด้วย AI (เกณฑ์ ≥ ${COURSE_MATCH_THRESHOLD}%)`}
                               </button>
+                              <button
+                                type="button"
+                                disabled={aiMatching}
+                                onClick={() => {
+                                  if (window.confirm("เทียบใหม่ทุกวิชาเลือก: ล้างผลที่บันทึกไว้และค้นข้อมูลภายนอก/เรียก AI ใหม่ทั้งหมด (มีค่าใช้จ่ายและใช้เวลา) ต้องการดำเนินการต่อหรือไม่?")) {
+                                    runAiCourseMatch(true);
+                                  }
+                                }}
+                                className="ml-2 px-2.5 py-1 rounded-lg border border-amber-600 text-amber-800 bg-white text-3xs font-bold hover:bg-amber-100 disabled:opacity-50 cursor-pointer"
+                              >
+                                ↻ เทียบใหม่ (ล้างผลเดิม)
+                              </button>
                               {aiMatchMsg && <span className="ml-2 font-normal text-3xs text-amber-900">{aiMatchMsg}</span>}
                             </td>
                           </tr>
