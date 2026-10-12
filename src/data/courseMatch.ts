@@ -25,8 +25,19 @@ export interface CourseMatchRequest {
   originCode?: string;
   originDescription?: string;
   originCredits?: number;
+  originCurriculum?: string; // ใช้ประกอบการค้นคำอธิบายรายวิชาเดิมจากภายนอก
+  lookupExternal?: boolean;  // false = ไม่ค้นภายนอก (ค่าเริ่มต้น: ค้นเมื่อวิชาเดิมไม่มีคำอธิบาย)
   targetCode: string;
   force?: boolean;
+}
+
+// ผลการค้นคำอธิบายรายวิชาเดิมจากภายนอก (ยังไม่ผ่านการตรวจสอบโดยเจ้าหน้าที่เสมอ)
+export interface OriginSourceInfo {
+  found: boolean;
+  officialName: string;
+  sources: string[];
+  unverified: true;
+  lookupError?: string;
 }
 
 export interface CourseMatchResult {
@@ -34,6 +45,7 @@ export interface CourseMatchResult {
   cached: boolean;
   targetCode: string;
   targetName: string;
+  originSource?: OriginSourceInfo | null;
 }
 
 export const courseMatchKey = (originName: string, targetCode: string) =>

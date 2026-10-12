@@ -11,7 +11,7 @@ import {
 } from "../types";
 import { standardSubjects2567 } from "../data/curriculumData";
 import { electiveSubjects2567 } from "../data/electiveSubjects";
-import { COURSE_MATCH_THRESHOLD, courseMatchKey } from "../data/courseMatch";
+import { COURSE_MATCH_THRESHOLD, courseMatchKey, type OriginSourceInfo } from "../data/courseMatch";
 import {
   calculateTransferResults,
   isCodeMatch,
@@ -95,6 +95,8 @@ export default function TransferWorkspace({
 
   // ผลเปรียบเทียบคำอธิบายรายวิชาด้วย AI (ร้อยละ) คีย์ = courseMatchKey(ชื่อวิชาเดิม, รหัส สกร. 2567)
   const [aiScores, setAiScores] = useState<Record<string, number>>({});
+  // ผลค้นคำอธิบายรายวิชาเดิมจากภายนอก (คีย์ = ชื่อวิชาเดิมที่ตัดช่องว่าง) ใช้แสดงแหล่งอ้างอิงให้เจ้าหน้าที่ตรวจสอบ
+  const [aiOriginSources, setAiOriginSources] = useState<Record<string, OriginSourceInfo>>({});
   const [aiMatching, setAiMatching] = useState(false);
   const [aiMatchMsg, setAiMatchMsg] = useState<string | null>(null);
   // ต้องตั้งก่อนคำนวณทุกครั้ง เพื่อให้ตัวคำนวณใช้ร้อยละนี้ตัดสินการเทียบวิชาเลือก
@@ -120,6 +122,7 @@ export default function TransferWorkspace({
     setAiMatching(true);
     setAiMatchMsg(null);
     const next: Record<string, number> = {};
+    const nextSources: Record<string, OriginSourceInfo> = {};
     let failed = 0;
     let cachedCount = 0;
     let lastError = "";
@@ -131,11 +134,12 @@ export default function TransferWorkspace({
           const r = await fetch("/api/match/course", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ originName: j.name, originCode: j.code, originCredits: j.credits, targetCode: j.target, force }),
+            body: JSON.stringify({ originName: j.name, originCode: j.code, originCredits: j.credits, originCurriculum: studentInfo.originCurriculum, targetCode: j.target, force }),
           });
           const data = await r.json();
           if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`);
           next[courseMatchKey(j.name, j.target)] = data.percent;
+          if (data.originSource) nextSources[courseMatchKey(j.name, "")] = data.originSource;
           if (data.cached) cachedCount++;
         } catch (e: any) {
           failed++;
@@ -145,6 +149,7 @@ export default function TransferWorkspace({
     };
     await Promise.all([worker(), worker(), worker()]);
     setAiScores(prev => ({ ...prev, ...next }));
+    setAiOriginSources(prev => ({ ...prev, ...nextSources }));
     const ok = Object.keys(next).length;
     setAiMatchMsg(
       `เปรียบเทียบแล้ว ${ok} คู่ (ใช้ผลที่บันทึกไว้ ${cachedCount} คู่)` + (failed ? ` • ไม่สำเร็จ ${failed} คู่: ${lastError}` : "")
@@ -1401,6 +1406,21 @@ export default function TransferWorkspace({
                                 </span>
                               )
                             )}
+                            {!carry && subject.mappedTo2567Code?.startsWith("ELECTIVE_") && aiOriginSources[courseMatchKey(subject.name, "")] && (() => {
+                              const src = aiOriginSources[courseMatchKey(subject.name, "")];
+                              return src.found ? (
+                                <span className="text-3xs text-sky-700 block mt-1 leading-snug">
+                                  🌐 คำอธิบายวิชาเดิมค้นจากภายนอก <b>(ยังไม่ได้ตรวจสอบ)</b>{src.officialName ? ` — ${src.officialName}` : ""}:{" "}
+                                  {src.sources.map((u, i) => (
+                                    <a key={u} href={u} target="_blank" rel="noopener noreferrer" className="underline mr-1">[{i + 1}]</a>
+                                  ))}
+                                </span>
+                              ) : (
+                                <span className="text-3xs text-gray-500 block mt-1 leading-snug">
+                                  🌐 ค้นคำอธิบายวิชาเดิมจากภายนอกไม่พบ — เทียบจากชื่อวิชาเท่านั้น (ผลอาจไม่แม่นยำ)
+                                </span>
+                              );
+                            })()}
                             {!carry && req.allowedType === "บังคับ" && isCurrentlyCompulsory && subject.mappedTo2567Code !== req.counterpartCode && (
                               <span className="text-3xs text-rose-600 block mt-1 font-semibold">❌ วิชาบังคับเดิมนี้ถ้าเทียบเข้าวิชาบังคับ ต้องเข้า [{req.counterpartCode}] เท่านั้น (หรือเลือกเทียบเป็นวิชาเลือกได้)</span>
                             )}

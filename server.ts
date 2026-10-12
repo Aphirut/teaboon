@@ -620,6 +620,75 @@ ${context ? `\n[ข้อมูลประกอบจากระบบเท�
     }
   })();
 
+  // ---- ค้นคำอธิบายรายวิชาเดิมจากภายนอก (โมเดลที่ค้นเว็บได้ เช่น Perplexity Sonar ผ่าน OpenRouter) พร้อมแคช ----
+  const searchModel = process.env.OPENROUTER_SEARCH_MODEL || "perplexity/sonar";
+  const chatUrl = process.env.OPENROUTER_CHAT_URL || "https://openrouter.ai/api/v1/chat/completions";
+  const originCachePath = path.join(process.cwd(), "data", "originDescriptionCache.json");
+  type OriginLookup = { found: boolean; officialName: string; description: string; sources: string[]; at: string };
+  let originCache: Record<string, OriginLookup> = {};
+  try {
+    originCache = JSON.parse(fs.readFileSync(originCachePath, "utf-8"));
+  } catch {
+    originCache = {};
+  }
+  const saveOriginCache = () => {
+    try {
+      fs.mkdirSync(path.dirname(originCachePath), { recursive: true });
+      fs.writeFileSync(originCachePath, JSON.stringify(originCache, null, 2), "utf-8");
+    } catch (e: any) {
+      console.error("Cannot save origin description cache:", e?.message);
+    }
+  };
+
+  const lookupOriginDescription = async (
+    name: string,
+    code: string,
+    curriculum: string,
+    force = false
+  ): Promise<OriginLookup & { cached: boolean }> => {
+    const key = crypto.createHash("sha1").update([name, code, curriculum, searchModel].join("|")).digest("hex");
+    if (!force && originCache[key]) return { ...originCache[key], cached: true };
+
+    const prompt =
+      `ค้นหาคำอธิบายรายวิชาอย่างเป็นทางการของรายวิชาต่อไปนี้ จากเว็บไซต์ทางการของหน่วยงานการศึกษาไทย (เช่น สพฐ., กระทรวงศึกษาธิการ, สกร./กศน., สอศ.) เป็นลำดับแรก\n` +
+      `รหัสวิชา: ${code || "-"}\nชื่อวิชา: ${name}\nหลักสูตร: ${curriculum || "-"}\n\n` +
+      `ถ้าไม่พบคำอธิบายที่เชื่อถือได้ ห้ามแต่งเนื้อหาขึ้นเอง ให้ตอบ found เป็น false\n` +
+      `ตอบเป็น JSON เพียงก้อนเดียว ห้ามมีข้อความอื่น: {"found": true|false, "officialName": "ชื่อวิชาตามแหล่งที่พบ", "description": "คำอธิบายรายวิชา/สาระสำคัญ/ผลการเรียนรู้ ตามต้นฉบับ"}`;
+
+    const r = await fetch(chatUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${openRouterApiKey}`, "X-Title": "SKR Transfer Credit 2567" },
+      body: JSON.stringify({ model: searchModel, messages: [{ role: "user", content: prompt }], temperature: 0.1 }),
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`ค้นข้อมูลภายนอกไม่สำเร็จ (รหัส ${r.status}): ${text.slice(0, 200)}`);
+    const data = JSON.parse(text);
+    const msg = data?.choices?.[0]?.message || {};
+    const urls = new Set<string>();
+    (data?.citations || []).forEach((u: any) => typeof u === "string" && urls.add(u));
+    (msg.annotations || []).forEach((a: any) => a?.url_citation?.url && urls.add(a.url_citation.url));
+
+    let parsed: any = {};
+    try {
+      parsed = cleanAndParseJSON(msg.content || "");
+    } catch {
+      parsed = {};
+    }
+    const description = typeof parsed.description === "string" ? parsed.description.trim() : "";
+    // ต้องมีข้อความและแหล่งอ้างอิงอย่างน้อยหนึ่งแหล่ง จึงถือว่าพบ (กันโมเดลแต่งเนื้อหาเอง)
+    const found = parsed.found === true && description.length >= 30 && urls.size > 0;
+    const result: OriginLookup = {
+      found,
+      officialName: found ? String(parsed.officialName || name) : "",
+      description: found ? description : "",
+      sources: Array.from(urls).slice(0, 5),
+      at: new Date().toISOString(),
+    };
+    originCache[key] = result;
+    saveOriginCache();
+    return { ...result, cached: false };
+  };
+
   app.post("/api/match/course", async (req, res) => {
     try {
       const body = (req.body || {}) as CourseMatchRequest;
@@ -628,14 +697,33 @@ ${context ? `\n[ข้อมูลประกอบจากระบบเท�
       if (!originName || !target) {
         return res.status(400).json({ error: "ต้องระบุชื่อวิชาเดิม (originName) และรหัสรายวิชา สกร. 2567 ที่มีคำอธิบาย (targetCode)" });
       }
-      const originDescription = (body.originDescription || "").trim();
+      let originDescription = (body.originDescription || "").trim();
+      let originSource: { found: boolean; officialName: string; sources: string[]; unverified: true } | null = null;
+      if (!originDescription && body.lookupExternal !== false) {
+        if (!openRouterApiKey || openRouterApiKey.trim() === "") {
+          return res.status(400).json({
+            error: "ยังไม่ได้ตั้งค่า OPENROUTER_API_KEY ระบบจึงเปรียบเทียบคำอธิบายรายวิชาไม่ได้",
+            hint: "เพิ่มบรรทัด OPENROUTER_API_KEY=คีย์ของท่าน ในไฟล์ .env.local แล้วเริ่มเซิร์ฟเวอร์ใหม่",
+          });
+        }
+        try {
+          const found = await lookupOriginDescription(originName, body.originCode || "", body.originCurriculum || "", !!body.force);
+          originSource = { found: found.found, officialName: found.officialName, sources: found.sources, unverified: true };
+          if (found.found) originDescription = found.description;
+        } catch (e: any) {
+          console.error("Origin lookup error:", e?.message);
+          // ค้นภายนอกไม่ได้ให้เทียบจากชื่อวิชาต่อ แต่แจ้งผู้ใช้ผ่านฟิลด์ lookupError
+          originSource = { found: false, officialName: "", sources: [], unverified: true };
+          (originSource as any).lookupError = e?.message;
+        }
+      }
       const key = crypto
         .createHash("sha1")
         .update([originName, body.originCode || "", originDescription, target.code, target.description, decisionsModel, COURSE_MATCH_VERSION].join("|"))
         .digest("hex");
 
       if (!body.force && matchCache[key]) {
-        return res.json({ percent: matchCache[key].percent, cached: true, targetCode: target.code, targetName: target.name });
+        return res.json({ percent: matchCache[key].percent, cached: true, targetCode: target.code, targetName: target.name, originSource });
       }
       if (!openRouterApiKey || openRouterApiKey.trim() === "") {
         return res.status(400).json({
@@ -665,7 +753,7 @@ ${context ? `\n[ข้อมูลประกอบจากระบบเท�
       const percent = scoreToPercent(score);
       matchCache[key] = { percent, at: new Date().toISOString() };
       saveMatchCache();
-      return res.json({ percent, cached: false, targetCode: target.code, targetName: target.name });
+      return res.json({ percent, cached: false, targetCode: target.code, targetName: target.name, originSource });
     } catch (error: any) {
       console.error("Course match error:", error);
       return res.status(500).json({ error: error.message || "เปรียบเทียบคำอธิบายรายวิชาไม่สำเร็จ" });
